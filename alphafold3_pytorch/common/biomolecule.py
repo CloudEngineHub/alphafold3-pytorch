@@ -1907,8 +1907,8 @@ def to_inference_mmcif(
     return _create_mmcif_string(init_metadata_dict)
 
 
-@typecheck
 @functools.lru_cache(maxsize=256)
+@typecheck
 def _int_id_to_str_id(num: IntType) -> str:
     """Encodes a number as a string, using reverse spreadsheet style naming.
 

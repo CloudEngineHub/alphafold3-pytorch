@@ -1,6 +1,6 @@
 [project]
 name = "alphafold3-pytorch"
-version = "0.7.12"
+version = "0.8.0"
 description = "Alphafold 3 - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" },
@@ -41,7 +41,7 @@ dependencies = [
     "fair-esm",
     "fastapi",
     "frame-averaging-pytorch>=0.0.18",
-    "hyper-connections>=0.0.23",
+    "hyper-connections>=0.1.20",
     "gradio",
     "gradio_molecule3d",
     "huggingface_hub>=0.21.4",
@@ -67,6 +67,7 @@ dependencies = [
     "timeout_decorator>=0.5.0",
     'torch_geometric',
     "torch>=2.1",
+    "torch-einops-utils>=0.1.12",
     "tqdm>=4.66.4",
     "transformers[torch]",
     "loguru",
@@ -112,6 +113,14 @@ lint.extend-select = [
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "alphafold3_pytorch",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["alphafold3_pytorch"]

@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import random
-import sh
 from math import pi, sqrt
 from pathlib import Path
-from itertools import product, zip_longest
+from inspect import signature
+from itertools import zip_longest
 from functools import partial, wraps
 from collections import namedtuple
 
 import torch
 from torch import nn
-from torch import Tensor, tensor, is_tensor
+from torch import Tensor, tensor, is_tensor, cat
 from torch.amp import autocast
 import torch.nn.functional as F
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_map, tree_flatten
 
 from torch.nn import (
     Module,
@@ -137,6 +137,10 @@ from Bio.PDB.StructureBuilder import StructureBuilder
 
 import einx
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
+from torch_einops_utils import (
+    masked_mean,
+    batched_index_select,
+)
 from einops.layers.torch import Rearrange
 
 """
@@ -2664,15 +2668,135 @@ class DiffusionModule(Module):
 # https://arxiv.org/abs/2206.00364
 
 class DiffusionLossBreakdown(NamedTuple):
-    diffusion_mse: Float['']
-    diffusion_bond: Float['']
-    diffusion_smooth_lddt: Float['']
+    diffusion_mse: Float[''] | Float['b']
+    diffusion_bond: Float[''] | Float['b']
+    diffusion_smooth_lddt: Float[''] | Float['b']
 
 class ElucidatedAtomDiffusionReturn(NamedTuple):
-    loss: Float['']
+    loss: Float[''] | Float['b']
     denoised_atom_pos: Float['ba m 3']
     loss_breakdown: DiffusionLossBreakdown
     noise_sigmas: Float[' ba']
+
+# explorative modeling (forward xm)
+# Alexi Gladstone et al. https://arxiv.org/abs/2607.27372
+
+class XMWrapper(Module):
+    def __new__(
+        cls,
+        edm: ElucidatedAtomDiffusion,
+        candidates = 1,
+        max_batch_size = None
+    ):
+        if candidates == 1:
+            return edm
+        return super().__new__(cls)
+
+    @typecheck
+    def __init__(
+        self,
+        edm: ElucidatedAtomDiffusion,
+        candidates = 1,
+        max_batch_size = None
+    ):
+        super().__init__()
+        self.edm = edm
+
+        assert candidates >= 1, 'candidates must be at least 1'
+        self.candidates = candidates
+        self.max_batch_size = max_batch_size
+
+    def sample(self, *args, **kwargs):
+        return self.edm.sample(*args, **kwargs)
+
+    def forward(
+        self,
+        *args,
+        candidates = None,
+        max_batch_size = None,
+        **kwargs
+    ):
+        candidates = default(candidates, self.candidates)
+        max_batch_size = default(max_batch_size, self.max_batch_size)
+
+        if candidates == 1:
+            return self.edm(*args, **kwargs)
+
+        def is_batch_tensor(t, b):
+            return is_tensor(t) and t.ndim > 0 and t.shape[0] == b
+
+        # find batch size from first tensor in inputs
+
+        leaves, _ = tree_flatten((args, kwargs))
+        first_tensor = next(t for t in leaves if is_tensor(t))
+        batch = first_tensor.shape[0]
+
+        # repeat inputs K candidates times
+
+        args_candidates, kwargs_candidates = tree_map(
+            lambda t: repeat(t, 'b ... -> (b k) ...', k = candidates) if is_batch_tensor(t, batch) else t,
+            (args, kwargs)
+        )
+
+        total = batch * candidates
+        chunk_size = default(max_batch_size, total)
+
+        # forward passes
+
+        candidate_losses = []
+        candidate_mse_losses = []
+        candidate_bond_losses = []
+        candidate_smooth_lddt_losses = []
+        all_denoised_atom_pos = []
+        all_noise_sigmas = []
+
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+
+            chunk_args, chunk_kwargs = tree_map(
+                lambda t: t[start:end] if is_batch_tensor(t, total) else t,
+                (args_candidates, kwargs_candidates)
+            )
+
+            out = self.edm(*chunk_args, loss_reduction = 'none', **chunk_kwargs)
+
+            candidate_losses.append(out.loss)
+            candidate_mse_losses.append(out.loss_breakdown.diffusion_mse)
+            candidate_bond_losses.append(out.loss_breakdown.diffusion_bond)
+            candidate_smooth_lddt_losses.append(out.loss_breakdown.diffusion_smooth_lddt)
+            all_denoised_atom_pos.append(out.denoised_atom_pos)
+            all_noise_sigmas.append(out.noise_sigmas)
+
+        # cat and split candidate outputs along batch and candidates dimensions
+
+        split_candidates = lambda t: rearrange(cat(t, dim = 0), '(b k) ... -> b k ...', b = batch, k = candidates)
+
+        candidate_losses = split_candidates(candidate_losses)
+        all_denoised_atom_pos = split_candidates(all_denoised_atom_pos)
+        candidate_mse_losses = split_candidates(candidate_mse_losses)
+        candidate_bond_losses = split_candidates(candidate_bond_losses)
+        candidate_smooth_lddt_losses = split_candidates(candidate_smooth_lddt_losses)
+        all_noise_sigmas = split_candidates(all_noise_sigmas)
+
+        # select candidate with minimum loss for each sample in batch
+
+        min_loss_indices = candidate_losses.argmin(dim = -1)
+        min_loss = candidate_losses.amin(dim = -1).mean()
+
+        # select best candidate outputs and loss breakdown
+
+        best_denoised_atom_pos = batched_index_select(all_denoised_atom_pos, min_loss_indices, dim = 1)
+        best_noise_sigmas = batched_index_select(all_noise_sigmas, min_loss_indices, dim = 1)
+
+        best_mse_loss = batched_index_select(candidate_mse_losses, min_loss_indices, dim = 1).mean()
+        best_bond_loss = batched_index_select(candidate_bond_losses, min_loss_indices, dim = 1).mean()
+        best_smooth_lddt_loss = batched_index_select(candidate_smooth_lddt_losses, min_loss_indices, dim = 1).mean()
+
+        best_loss_breakdown = DiffusionLossBreakdown(best_mse_loss, best_bond_loss, best_smooth_lddt_loss)
+
+        return ElucidatedAtomDiffusionReturn(min_loss, best_denoised_atom_pos, best_loss_breakdown, best_noise_sigmas)
+
+# main elucidated atom diffusion
 
 class ElucidatedAtomDiffusion(Module):
     @typecheck
@@ -2813,13 +2937,14 @@ class ElucidatedAtomDiffusion(Module):
     # sample schedule
     # equation (5) in the paper
 
-    def sample_schedule(self, num_sample_steps = None):
+    def sample_schedule(self, num_sample_steps = None, device = None):
         num_sample_steps = default(num_sample_steps, self.num_sample_steps)
+        device = default(device, self.device)
 
         N = num_sample_steps
         inv_rho = 1 / self.rho
 
-        steps = torch.arange(num_sample_steps, device=self.device, dtype=self.dtype)
+        steps = torch.arange(num_sample_steps, device = device, dtype = self.dtype)
         sigmas = (self.sigma_max ** inv_rho + steps / (N - 1) * (self.sigma_min ** inv_rho - self.sigma_max ** inv_rho)) ** self.rho
 
         sigmas = F.pad(sigmas, (0, 1), value = 0.) # last step is sigma value of 0.
@@ -2839,6 +2964,7 @@ class ElucidatedAtomDiffusion(Module):
     ) -> Float['b m 3'] | Float['ts b m 3']:
 
         dtype = self.dtype
+        device = atom_mask.device
 
         step_scale, num_sample_steps = self.step_scale, default(num_sample_steps, self.num_sample_steps)
 
@@ -2848,7 +2974,7 @@ class ElucidatedAtomDiffusion(Module):
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
 
-        sigmas = self.sample_schedule(num_sample_steps)
+        sigmas = self.sample_schedule(num_sample_steps, device = device)
 
         gammas = torch.where(
             (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
@@ -2862,7 +2988,7 @@ class ElucidatedAtomDiffusion(Module):
 
         init_sigma = sigmas[0]
 
-        atom_pos = init_sigma * torch.randn(shape, dtype = dtype, device = self.device)
+        atom_pos = init_sigma * torch.randn(shape, dtype = dtype, device = device)
 
         # gradually denoise
 
@@ -2878,7 +3004,7 @@ class ElucidatedAtomDiffusion(Module):
             atom_pos = maybe_augment_fn(atom_pos.float()).type(dtype)
 
             eps = self.S_noise * torch.randn(
-                shape, dtype = dtype, device = self.device
+                shape, dtype = dtype, device = device
             )  # stochastic sampling
 
             sigma_hat = sigma + gamma * sigma
@@ -2920,8 +3046,9 @@ class ElucidatedAtomDiffusion(Module):
         """ for some reason, in paper they add instead of multiply as in original paper """
         return (sigma ** 2 + self.sigma_data ** 2) * (sigma + self.sigma_data) ** -2
 
-    def noise_distribution(self, batch_size):
-        return (self.P_mean + self.P_std * torch.randn((batch_size,), device = self.device)).exp() * self.sigma_data
+    def noise_distribution(self, batch_size, device = None):
+        device = default(device, self.device)
+        return (self.P_mean + self.P_std * torch.randn((batch_size,), device = device)).exp() * self.sigma_data
 
     @typecheck
     def forward(
@@ -2940,17 +3067,16 @@ class ElucidatedAtomDiffusion(Module):
         molecule_atom_indices: Int['b n'] | None = None,
         missing_atom_mask: Bool['b m'] | None = None,
         atom_parent_ids: Int['b m'] | None = None,
-        return_denoised_pos = False,
         is_molecule_types: Bool[f'b n {IS_MOLECULE_TYPES}'] | None = None,
         additional_molecule_feats: Int[f'b n {ADDITIONAL_MOLECULE_FEATS}'] | None = None,
         add_smooth_lddt_loss = False,
         add_bond_loss = False,
         nucleotide_loss_weight = 5.,
         ligand_loss_weight = 10.,
-        return_loss_breakdown = False,
-        single_structure_input=False,
-        verbose=None,
+        single_structure_input = False,
+        verbose = None,
         filepath: List[str] | Tuple[str] | None = None,
+        loss_reduction: Literal['mean', 'none'] = 'mean',
     ) -> ElucidatedAtomDiffusionReturn:
         verbose = default(verbose, self.verbose)
 
@@ -2959,10 +3085,10 @@ class ElucidatedAtomDiffusion(Module):
         if verbose:
             logger.info("Sampling noise distribution within EDM")
 
-        dtype = atom_pos_ground_truth.dtype
+        device, dtype = atom_pos_ground_truth.device, atom_pos_ground_truth.dtype
         batch_size = atom_pos_ground_truth.shape[0]
 
-        sigmas = self.noise_distribution(batch_size).type(dtype)
+        sigmas = self.noise_distribution(batch_size, device = device).type(dtype)
         padded_sigmas = rearrange(sigmas, 'b -> b 1 1')
 
         noise = torch.randn_like(atom_pos_ground_truth)
@@ -3056,15 +3182,15 @@ class ElucidatedAtomDiffusion(Module):
         if exists(missing_atom_mask):
             atom_mask = atom_mask & ~ missing_atom_mask
 
-        # account for atom mask
+        # account for atom mask (per-sample loss)
 
-        mse_loss = losses[atom_mask].mean()
+        mse_loss = masked_mean(losses, atom_mask, dim = (-2, -1))
 
-        total_loss = total_loss + mse_loss
+        total_loss = mse_loss
 
         # proposed extra bond loss during finetuning
 
-        bond_loss = self.zero
+        bond_loss = mse_loss.new_zeros(batch_size)
 
         if add_bond_loss:
             if verbose:
@@ -3081,24 +3207,24 @@ class ElucidatedAtomDiffusion(Module):
             if atompair_mask.sum() > MAX_CONCURRENT_TENSOR_ELEMENTS:
                 if verbose:
                     logger.info("Subsetting atom pairs for backprop within EDM")
-                
+
                 # randomly subset the atom pairs to supervise
 
-                flat_atompair_mask_indices = torch.arange(atompair_mask.numel(), device=self.device)[atompair_mask.view(-1)]
+                flat_atompair_mask_indices = torch.arange(atompair_mask.numel(), device = device)[atompair_mask.view(-1)]
                 num_true_atompairs = flat_atompair_mask_indices.size(0)
 
                 num_atompairs_to_ignore = num_true_atompairs - MAX_CONCURRENT_TENSOR_ELEMENTS
                 ignored_atompair_indices = flat_atompair_mask_indices[torch.randperm(num_true_atompairs)[:num_atompairs_to_ignore]]
-                
+
                 atompair_mask.view(-1)[ignored_atompair_indices] = False
 
-            bond_loss = bond_losses[atompair_mask].mean()
+            bond_loss = masked_mean(bond_losses, atompair_mask, dim = (-2, -1))
 
             total_loss = total_loss + bond_loss
 
         # proposed auxiliary smooth lddt loss
 
-        smooth_lddt_loss = self.zero
+        smooth_lddt_loss = mse_loss.new_zeros(batch_size)
 
         if add_smooth_lddt_loss:
             if verbose:
@@ -3113,7 +3239,7 @@ class ElucidatedAtomDiffusion(Module):
                 for t in is_nucleotide_or_ligand_fields
             )
             is_nucleotide_or_ligand_fields = tuple(
-                pad_or_slice_to(t, length=align_weights.shape[-1], dim=-1)
+                pad_or_slice_to(t, length = align_weights.shape[-1], dim = -1)
                 for t in is_nucleotide_or_ligand_fields
             )
 
@@ -3124,7 +3250,8 @@ class ElucidatedAtomDiffusion(Module):
                 atom_pos_ground_truth,
                 atom_is_dna,
                 atom_is_rna,
-                coords_mask = atom_mask
+                coords_mask = atom_mask,
+                loss_reduction = loss_reduction,
             )
 
             total_loss = total_loss + smooth_lddt_loss
@@ -3133,7 +3260,12 @@ class ElucidatedAtomDiffusion(Module):
 
         loss_breakdown = DiffusionLossBreakdown(mse_loss, bond_loss, smooth_lddt_loss)
 
-        return ElucidatedAtomDiffusionReturn(total_loss, denoised_atom_pos, loss_breakdown, sigmas)
+        if loss_reduction == 'none':
+            return ElucidatedAtomDiffusionReturn(total_loss, denoised_atom_pos, loss_breakdown, sigmas)
+
+        loss_breakdown = DiffusionLossBreakdown(mse_loss.mean(), bond_loss.mean(), smooth_lddt_loss.mean())
+
+        return ElucidatedAtomDiffusionReturn(total_loss.mean(), denoised_atom_pos, loss_breakdown, sigmas)
 
 # modules todo
 
@@ -3160,7 +3292,8 @@ class SmoothLDDTLoss(Module):
         is_dna: Bool['b n'],
         is_rna: Bool['b n'],
         coords_mask: Bool['b n'] | None = None,
-    ) -> Float['']:
+        loss_reduction: Literal['mean', 'none'] = 'mean',
+    ) -> Float[''] | Float['b']:
         """
         pred_coords: predicted coordinates
         true_coords: true coordinates
@@ -3201,7 +3334,12 @@ class SmoothLDDTLoss(Module):
         # Calculate masked averaging
         lddt = masked_average(eps, mask = mask, dim = (-1, -2), eps = 1)
 
-        return 1. - lddt.mean()
+        loss = 1. - lddt
+
+        if loss_reduction == 'none':
+            return loss
+
+        return loss.mean()
 
 class WeightedRigidAlign(Module):
     """Algorithm 28."""
@@ -6218,6 +6356,8 @@ class Alphafold3(Module):
         sigma_data = 16,
         num_rollout_steps = 20,
         diffusion_num_augmentations = 48,
+        diffusion_candidates = 1,
+        diffusion_max_batch_size = None,
         loss_confidence_weight = 1e-4,
         loss_distogram_weight = 1e-2,
         loss_diffusion_weight = 4.,
@@ -6538,6 +6678,8 @@ class Alphafold3(Module):
             ),
             **edm_kwargs
         )
+
+        self.edm = XMWrapper(self.edm, candidates = diffusion_candidates, max_batch_size = diffusion_max_batch_size)
 
         self.num_rollout_steps = num_rollout_steps
 
@@ -7428,7 +7570,6 @@ class Alphafold3(Module):
                 molecule_atom_lens = molecule_atom_lens,
                 molecule_atom_indices = molecule_atom_indices,
                 token_bonds = token_bonds,
-                return_denoised_pos = True,
                 nucleotide_loss_weight = self.nucleotide_loss_weight,
                 ligand_loss_weight = self.ligand_loss_weight,
                 single_structure_input = single_structure_input,
