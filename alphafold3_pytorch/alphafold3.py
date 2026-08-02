@@ -2731,6 +2731,9 @@ class XMWrapper(Module):
         first_tensor = next(t for t in leaves if is_tensor(t))
         batch = first_tensor.shape[0]
 
+        if 'sigmas' not in kwargs:
+            kwargs['sigmas'] = self.edm.noise_distribution(batch)
+
         # repeat inputs K candidates times
 
         args_candidates, kwargs_candidates = tree_map(
@@ -3077,6 +3080,7 @@ class ElucidatedAtomDiffusion(Module):
         verbose = None,
         filepath: List[str] | Tuple[str] | None = None,
         loss_reduction: Literal['mean', 'none'] = 'mean',
+        sigmas: Float['b'] | None = None,
     ) -> ElucidatedAtomDiffusionReturn:
         verbose = default(verbose, self.verbose)
 
@@ -3088,7 +3092,7 @@ class ElucidatedAtomDiffusion(Module):
         device, dtype = atom_pos_ground_truth.device, atom_pos_ground_truth.dtype
         batch_size = atom_pos_ground_truth.shape[0]
 
-        sigmas = self.noise_distribution(batch_size, device = device).type(dtype)
+        sigmas = default(sigmas, lambda: self.noise_distribution(batch_size, device = device).type(dtype))
         padded_sigmas = rearrange(sigmas, 'b -> b 1 1')
 
         noise = torch.randn_like(atom_pos_ground_truth)
