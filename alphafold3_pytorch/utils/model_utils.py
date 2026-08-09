@@ -594,7 +594,7 @@ def calculate_weighted_rigid_align_weights(
             for t in is_nucleotide_or_ligand_fields
         )
 
-        _, atom_is_dna, atom_is_rna, atom_is_ligand, _ = is_nucleotide_or_ligand_fields
+        _, atom_is_rna, atom_is_dna, atom_is_ligand, _ = is_nucleotide_or_ligand_fields
 
         # section 3.7.1 equation 4
 

@@ -175,3 +175,7 @@ cython_debug/
 .err
 .log
 .sif
+nim_modules/
+nimcache/
+nimblecache/
+.DS_Store

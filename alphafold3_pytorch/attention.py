@@ -401,9 +401,7 @@ class Attend(Module):
 
         # handle attention bias (inefficiently)
 
-        is_full_attn_bias = attn_bias.shape[-1] == attn_bias.shape[-2]
-
-        if exists(attn_bias) and is_full_attn_bias:
+        if exists(attn_bias) and attn_bias.shape[-1] == attn_bias.shape[-2]:
             attn_bias = full_attn_bias_to_windowed(attn_bias, window_size = window_size)
 
         # carry out attention as usual

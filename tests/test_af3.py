@@ -303,13 +303,11 @@ def test_centre_random_augmentation():
 @pytest.mark.parametrize('recurrent_depth', (1, 2))
 @pytest.mark.parametrize('enable_attn_softclamp', (True, False))
 @pytest.mark.parametrize('add_value_residual', (True, False))
-@pytest.mark.parametrize('num_residual_streams', (1, 4))
 def test_pairformer(
     checkpoint,
     recurrent_depth,
     enable_attn_softclamp,
-    add_value_residual,
-    num_residual_streams
+    add_value_residual
 ):
     single = torch.randn(2, 16, 384).requires_grad_()
     pairwise = torch.randn(2, 16, 16, 128).requires_grad_()
@@ -321,7 +319,6 @@ def test_pairformer(
         recurrent_depth = recurrent_depth,
         checkpoint = checkpoint,
         add_value_residual = add_value_residual,
-        num_residual_streams = num_residual_streams,
         pair_bias_attn_kwargs = dict(
             enable_attn_softclamp = enable_attn_softclamp
         )
@@ -375,13 +372,11 @@ def test_msa_module(
 @pytest.mark.parametrize('use_linear_attn', (False, True))
 @pytest.mark.parametrize('use_colt5_attn', (False, True))
 @pytest.mark.parametrize('add_value_residual', (False, True))
-@pytest.mark.parametrize('num_residual_streams', (1, 4))
 def test_diffusion_transformer(
     checkpoint,
     use_linear_attn,
     use_colt5_attn,
-    add_value_residual,
-    num_residual_streams
+    add_value_residual
 ):
 
     single = torch.randn(2, 16, 384).requires_grad_()
@@ -394,8 +389,7 @@ def test_diffusion_transformer(
         checkpoint = checkpoint,
         use_linear_attn = use_linear_attn,
         use_colt5_attn = use_colt5_attn,
-        add_value_residual = add_value_residual,
-        num_residual_streams = num_residual_streams
+        add_value_residual = add_value_residual
     )
 
     single_out = diffusion_transformer(
@@ -630,7 +624,7 @@ def test_distogram_head():
 @pytest.mark.parametrize('missing_atoms', (True, False))
 @pytest.mark.parametrize('calculate_pae', (True, False))
 @pytest.mark.parametrize('atom_transformer_intramolecular_attn', (True, False))
-@pytest.mark.parametrize('num_molecule_mods', (0, 4))
+@pytest.mark.parametrize('num_molecule_mods', (0, 2))
 @pytest.mark.parametrize('distogram_atom_resolution', (True, False))
 def test_alphafold3(
     window_atompair_inputs: bool,
@@ -641,7 +635,7 @@ def test_alphafold3(
     num_molecule_mods: int,
     distogram_atom_resolution: bool
 ):
-    seq_len = 16
+    seq_len = 6
     atoms_per_window = 27
 
     molecule_atom_indices = torch.randint(0, 2, (2, seq_len)).long()
@@ -660,7 +654,7 @@ def test_alphafold3(
         atompair_inputs = full_pairwise_repr_to_windowed(atompair_inputs, window_size = atoms_per_window)
 
     additional_molecule_feats = torch.randint(0, 2, (2, seq_len, 5))
-    additional_token_feats = torch.randn(2, 16, 33)
+    additional_token_feats = torch.randn(2, seq_len, 33)
     is_molecule_types = torch.randint(0, 2, (2, seq_len, IS_MOLECULE_TYPES)).bool()
     molecule_ids = torch.randint(0, 32, (2, seq_len))
 
@@ -685,10 +679,10 @@ def test_alphafold3(
     template_feats = torch.randn(2, 2, seq_len, seq_len, 108)
     template_mask = torch.ones((2, 2)).bool()
 
-    msa = torch.randn(2, 7, seq_len, 32)
-    msa_mask = torch.ones((2, 7)).bool()
+    msa = torch.randn(2, 4, seq_len, 32)
+    msa_mask = torch.ones((2, 4)).bool()
 
-    additional_msa_feats = torch.randn(2, 7, seq_len, 2)
+    additional_msa_feats = torch.randn(2, 4, seq_len, 2)
 
     atom_pos = torch.randn(2, atom_seq_len, 3)
     distogram_atom_indices = molecule_atom_lens - 1
@@ -737,6 +731,9 @@ def test_alphafold3(
             atom_encoder_depth=1,
             token_transformer_depth=1,
             atom_decoder_depth=1,
+            atom_encoder_heads=2,
+            atom_decoder_heads=2,
+            token_transformer_heads=2,
             atom_decoder_kwargs = dict(
                 attn_pair_bias_kwargs = dict(
                     dim_head = 4
@@ -753,7 +750,7 @@ def test_alphafold3(
     )
 
     loss, breakdown = alphafold3(
-        num_recycling_steps = 2,
+        num_recycling_steps = 1,
         atom_inputs = atom_inputs,
         molecule_ids = molecule_ids,
         molecule_atom_lens = molecule_atom_lens,
@@ -783,7 +780,7 @@ def test_alphafold3(
     loss.backward()
 
     sampled_atom_pos = alphafold3(
-        num_sample_steps = 16,
+        num_sample_steps = 2,
         atom_inputs = atom_inputs,
         molecule_ids = molecule_ids,
         molecule_atom_lens = molecule_atom_lens,

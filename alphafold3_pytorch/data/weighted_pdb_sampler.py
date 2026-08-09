@@ -110,19 +110,17 @@ def compute_chain_weights(
     cluster_idx = chains.get_column_index("cluster_id")
     cluster_sizes = get_cluster_sizes(chains, "cluster_id")
 
-    return (
-        chains.map_rows(
-            lambda row: get_chain_weight(
-                row[molecule_idx].split("-")[0],
-                cluster_sizes[row[cluster_idx]],
-                alphas,
-                beta,
-            ),
-            return_dtype=pl.Float32,
+    weights = [
+        get_chain_weight(
+            row[molecule_idx].split("-")[0],
+            cluster_sizes[row[cluster_idx]],
+            alphas,
+            beta,
         )
-        .to_series(0)
-        .rename("weight")
-    )
+        for row in chains.rows()
+    ]
+
+    return pl.Series(weights, dtype=pl.Float32).rename("weight")
 
 
 @typecheck
@@ -135,20 +133,18 @@ def compute_interface_weights(
     cluster_idx = interfaces.get_column_index("interface_cluster_id")
     cluster_sizes = get_cluster_sizes(interfaces, "interface_cluster_id")
 
-    return (
-        interfaces.map_rows(
-            lambda row: get_interface_weight(
-                row[molecule_idx_1].split("-")[0],
-                row[molecule_idx_2].split("-")[0],
-                cluster_sizes[row[cluster_idx]],
-                alphas,
-                beta,
-            ),
-            return_dtype=pl.Float32,
+    weights = [
+        get_interface_weight(
+            row[molecule_idx_1].split("-")[0],
+            row[molecule_idx_2].split("-")[0],
+            cluster_sizes[row[cluster_idx]],
+            alphas,
+            beta,
         )
-        .to_series(0)
-        .rename("weight")
-    )
+        for row in interfaces.rows()
+    ]
+
+    return pl.Series(weights, dtype=pl.Float32).rename("weight")
 
 
 class WeightedPDBSampler(Sampler[List[str]]):

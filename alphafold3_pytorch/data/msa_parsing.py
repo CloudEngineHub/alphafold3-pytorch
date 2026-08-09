@@ -13,8 +13,9 @@ from cachetools import cached, LRUCache
 
 from beartype.typing import Literal, Optional, Sequence, Tuple
 
+from alphafold3_pytorch.nim import deletion_bytes_to_matrix, import_nim_a3m_parse
 from alphafold3_pytorch.tensor_typing import typecheck
-from alphafold3_pytorch.utils.utils import not_exists
+from alphafold3_pytorch.utils.utils import exists, not_exists
 
 DeletionMatrix = Sequence[Sequence[int]]
 
@@ -251,6 +252,19 @@ def parse_a3m(a3m_string: str, msa_type: MSA_TYPE) -> Msa:
         * A list of descriptions, one per sequence, from the a3m file.
         * The type of the sequences in the MSA.
     """
+
+    nim_a3m_parse = import_nim_a3m_parse()
+
+    if exists(nim_a3m_parse):
+        nim_sequences, nim_deletion_bytes, nim_row_lengths, nim_descriptions = (
+            nim_a3m_parse.parse_a3m(a3m_string)
+        )
+        return Msa(
+            sequences=nim_sequences,
+            deletion_matrix=deletion_bytes_to_matrix(nim_deletion_bytes, nim_row_lengths),
+            descriptions=nim_descriptions,
+            msa_type=msa_type,
+        )
 
     sequences, descriptions = parse_fasta(a3m_string)
     deletion_matrix = []

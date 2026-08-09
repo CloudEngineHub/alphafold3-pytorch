@@ -119,8 +119,6 @@ from taylor_series_linear_attention import TaylorSeriesLinearAttn
 
 from colt5_attention import ConditionalRoutedAttention
 
-from hyper_connections.hyper_connections_with_multi_input_streams import HyperConnections
-
 # other external libs
 
 from tqdm import tqdm
@@ -1434,15 +1432,10 @@ class PairformerStack(Module):
         num_register_tokens = 0,
         checkpoint = False,
         add_value_residual = False,
-        num_residual_streams = 1,
         pairwise_block_kwargs: dict = dict(),
         pair_bias_attn_kwargs: dict = dict()
     ):
         super().__init__()
-
-        # residual / hyper connections
-
-        init_hyper_conn, self.expand_streams, self.reduce_streams = HyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
         # layers
 
@@ -1474,9 +1467,9 @@ class PairformerStack(Module):
             single_transition = Transition(dim = dim_single)
 
             layers.append(ModuleList([
-                init_hyper_conn(dim = dim_pairwise, branch = pairwise_block),
-                init_hyper_conn(dim = dim_single, additional_input_paths = [('pairwise_repr', dim_pairwise)], branch = single_pre_ln(pair_bias_attn)),
-                init_hyper_conn(dim = dim_single, branch = single_pre_ln(single_transition)),
+                pairwise_block,
+                single_pre_ln(pair_bias_attn),
+                single_pre_ln(single_transition),
             ]))
 
         self.layers = layers
@@ -1511,9 +1504,6 @@ class PairformerStack(Module):
 
     ) -> Tuple[Float['b n ds'], Float['b n n dp']]:
 
-        single_repr = self.expand_streams(single_repr)
-        pairwise_repr = self.expand_streams(pairwise_repr)
-
         for _ in range(self.recurrent_depth):
 
             value_residual = None
@@ -1527,16 +1517,14 @@ class PairformerStack(Module):
 
                 pairwise_repr, pairwise_attn_values = pairwise_block(pairwise_repr, mask = mask, value_residuals = pairwise_value_residuals, return_values = True)
 
-                single_repr, attn_values = pair_bias_attn(single_repr, pairwise_repr = pairwise_repr, mask = mask, return_values = True, value_residual = value_residual)
+                attn_out, attn_values = pair_bias_attn(single_repr, pairwise_repr = pairwise_repr, mask = mask, return_values = True, value_residual = value_residual)
+                single_repr = single_repr + attn_out
 
                 if self.add_value_residual:
                     value_residual = default(value_residual, attn_values)
                     pairwise_value_residuals = default(pairwise_value_residuals, pairwise_attn_values)
 
-                single_repr = single_transition(single_repr)
-
-        single_repr = self.reduce_streams(single_repr)
-        pairwise_repr = self.reduce_streams(pairwise_repr)
+                single_repr = single_transition(single_repr) + single_repr
 
         return single_repr, pairwise_repr
 
@@ -1566,7 +1554,8 @@ class PairformerStack(Module):
             @wraps(layer)
             def inner(inputs, *args, **kwargs):
                 single_repr, pairwise_repr, mask, maybe_value_residual, maybe_pairwise_value_residuals  = inputs
-                single_repr, attn_values = layer(single_repr, pairwise_repr = pairwise_repr, mask = mask, return_values = True, value_residual = maybe_value_residual)
+                attn_out, attn_values = layer(single_repr, pairwise_repr = pairwise_repr, mask = mask, return_values = True, value_residual = maybe_value_residual)
+                single_repr = single_repr + attn_out
 
                 if self.add_value_residual:
                     maybe_value_residual = default(maybe_value_residual, attn_values)
@@ -1578,7 +1567,7 @@ class PairformerStack(Module):
             @wraps(layer)
             def inner(inputs, *args, **kwargs):
                 single_repr, pairwise_repr, mask, maybe_value_residual, maybe_pairwise_value_residuals = inputs
-                single_repr = layer(single_repr)
+                single_repr = layer(single_repr) + single_repr
                 return single_repr, pairwise_repr, mask, maybe_value_residual, maybe_pairwise_value_residuals
             return inner
 
@@ -1594,9 +1583,6 @@ class PairformerStack(Module):
             wrapped_layers.append(pair_bias_attn_wrapper(pair_bias_attn))
             wrapped_layers.append(single_transition_wrapper(single_transition))
 
-        single_repr = self.expand_streams(single_repr)
-        pairwise_repr = self.expand_streams(pairwise_repr)
-
         for _ in range(self.recurrent_depth):
             inputs = (single_repr, pairwise_repr, mask, None, None)
 
@@ -1604,9 +1590,6 @@ class PairformerStack(Module):
                 inputs = checkpoint(layer, inputs)
 
             single_repr, pairwise_repr, *_ = inputs
-
-        single_repr = self.reduce_streams(single_repr)
-        pairwise_repr = self.reduce_streams(pairwise_repr)
 
         return single_repr, pairwise_repr
 
@@ -2036,7 +2019,6 @@ class DiffusionTransformer(Module):
         use_linear_attn = False,
         checkpoint = False,
         add_value_residual = False,
-        num_residual_streams = 1,
         linear_attn_kwargs = dict(
             heads = 8,
             dim_head = 16
@@ -2054,10 +2036,6 @@ class DiffusionTransformer(Module):
         self.attn_window_size = attn_window_size
 
         dim_single_cond = default(dim_single_cond, dim)
-
-        # hyper connections
-
-        init_hyper_conn, self.expand_streams, self.reduce_streams = HyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
         # layers
 
@@ -2077,8 +2055,6 @@ class DiffusionTransformer(Module):
                     **linear_attn_kwargs
                 )
 
-                linear_attn = init_hyper_conn(dim = dim, branch = linear_attn)
-
             colt5_attn = None
 
             if use_colt5_attn:
@@ -2087,8 +2063,6 @@ class DiffusionTransformer(Module):
                     has_light_attn = False,
                     **colt5_attn_kwargs
                 )
-
-                colt5_attn = init_hyper_conn(dim = dim, branch = colt5_attn)
 
             accept_value_residual = add_value_residual and not is_first
 
@@ -2122,8 +2096,8 @@ class DiffusionTransformer(Module):
             layers.append(ModuleList([
                 linear_attn,
                 colt5_attn,
-                init_hyper_conn(dim = dim, branch = conditionable_pair_bias),
-                init_hyper_conn(dim = dim, branch = conditionable_transition)
+                conditionable_pair_bias,
+                conditionable_transition
             ]))
 
         self.checkpoint = checkpoint
@@ -2157,7 +2131,7 @@ class DiffusionTransformer(Module):
             @wraps(fn)
             def inner(inputs):
                 noised_repr, single_repr, pairwise_repr, mask, windowed_mask, maybe_value_residual = inputs
-                noised_repr = fn(noised_repr, mask = mask)
+                noised_repr = fn(noised_repr, mask = mask) + noised_repr
                 return noised_repr, single_repr, pairwise_repr, mask, windowed_mask, maybe_value_residual
             return inner
 
@@ -2165,7 +2139,8 @@ class DiffusionTransformer(Module):
             @wraps(fn)
             def inner(inputs):
                 noised_repr, single_repr, pairwise_repr, mask, windowed_mask, maybe_value_residual = inputs
-                noised_repr, attn_values = fn(noised_repr, cond = single_repr, pairwise_repr = pairwise_repr, mask = mask, windowed_mask = windowed_mask, value_residual = maybe_value_residual, return_values = True)
+                attn_out, attn_values = fn(noised_repr, cond = single_repr, pairwise_repr = pairwise_repr, mask = mask, windowed_mask = windowed_mask, value_residual = maybe_value_residual, return_values = True)
+                noised_repr = noised_repr + attn_out
 
                 if self.add_value_residual:
                     maybe_value_residual = default(maybe_value_residual, attn_values)
@@ -2177,7 +2152,7 @@ class DiffusionTransformer(Module):
             @wraps(fn)
             def inner(inputs):
                 noised_repr, single_repr, pairwise_repr, mask, windowed_mask, maybe_value_residual = inputs
-                noised_repr = fn(noised_repr, cond = single_repr)
+                noised_repr = fn(noised_repr, cond = single_repr) + noised_repr
                 return noised_repr, single_repr, pairwise_repr, mask, windowed_mask, maybe_value_residual
             return inner
 
@@ -2196,16 +2171,12 @@ class DiffusionTransformer(Module):
 
         # forward
 
-        noised_repr = self.expand_streams(noised_repr)
-
         inputs = (noised_repr, single_repr, pairwise_repr, mask, windowed_mask, None)
 
         for layer in wrapped_layers:
             inputs = checkpoint(layer, inputs)
 
         noised_repr, *_ = inputs
-
-        noised_repr = self.reduce_streams(noised_repr)
 
         return noised_repr
 
@@ -2222,17 +2193,15 @@ class DiffusionTransformer(Module):
 
         value_residual = None
 
-        noised_repr = self.expand_streams(noised_repr)
-
         for linear_attn, colt5_attn, attn, transition in self.layers:
 
             if exists(linear_attn):
-                noised_repr = linear_attn(noised_repr, mask = mask)
+                noised_repr = linear_attn(noised_repr, mask = mask) + noised_repr
 
             if exists(colt5_attn):
-                noised_repr = colt5_attn(noised_repr, mask = mask)
+                noised_repr = colt5_attn(noised_repr, mask = mask) + noised_repr
 
-            noised_repr, attn_values = attn(
+            attn_out, attn_values = attn(
                 noised_repr,
                 cond = single_repr,
                 pairwise_repr = pairwise_repr,
@@ -2241,6 +2210,7 @@ class DiffusionTransformer(Module):
                 return_values = True,
                 value_residual = value_residual
             )
+            noised_repr = noised_repr + attn_out
 
             if self.add_value_residual:
                 value_residual = default(value_residual, attn_values)
@@ -2248,9 +2218,7 @@ class DiffusionTransformer(Module):
             noised_repr = transition(
                 noised_repr,
                 cond = single_repr
-            )
-
-        noised_repr = self.reduce_streams(noised_repr)
+            ) + noised_repr
 
         return noised_repr
 
@@ -3092,7 +3060,7 @@ class ElucidatedAtomDiffusion(Module):
         device, dtype = atom_pos_ground_truth.device, atom_pos_ground_truth.dtype
         batch_size = atom_pos_ground_truth.shape[0]
 
-        sigmas = default(sigmas, lambda: self.noise_distribution(batch_size, device = device).type(dtype))
+        sigmas = self.noise_distribution(batch_size, device = device).type(dtype) if not exists(sigmas) else sigmas
         padded_sigmas = rearrange(sigmas, 'b -> b 1 1')
 
         noise = torch.randn_like(atom_pos_ground_truth)
@@ -3247,7 +3215,7 @@ class ElucidatedAtomDiffusion(Module):
                 for t in is_nucleotide_or_ligand_fields
             )
 
-            _, atom_is_dna, atom_is_rna, _, _ = is_nucleotide_or_ligand_fields
+            _, atom_is_rna, atom_is_dna, _, _ = is_nucleotide_or_ligand_fields
 
             smooth_lddt_loss = self.smooth_lddt_loss(
                 denoised_atom_pos,
@@ -6209,7 +6177,7 @@ class ComputeModelSelectionScore(Module):
         molecule_ids = batch_dict["molecule_ids"]
 
         valid_atom_len_mask = batch_dict["molecule_atom_lens"] >= 0
-        tok_repr_atm_mask = batch_dict["distogram_atom_indices"] >= 0 & valid_atom_len_mask
+        tok_repr_atm_mask = (batch_dict["distogram_atom_indices"] >= 0) & valid_atom_len_mask
 
         # score samples
 
@@ -6990,11 +6958,11 @@ class Alphafold3(Module):
         molecule_atom_lens = molecule_atom_lens.masked_fill(~valid_atom_len_mask, 0)
 
         if exists(molecule_atom_indices):
-            valid_molecule_atom_mask = molecule_atom_indices >= 0 & valid_atom_len_mask
+            valid_molecule_atom_mask = (molecule_atom_indices >= 0) & valid_atom_len_mask
             molecule_atom_indices = molecule_atom_indices.masked_fill(~valid_molecule_atom_mask, 0)
 
         if exists(distogram_atom_indices):
-            valid_distogram_mask = distogram_atom_indices >= 0 & valid_atom_len_mask
+            valid_distogram_mask = (distogram_atom_indices >= 0) & valid_atom_len_mask
             distogram_atom_indices = distogram_atom_indices.masked_fill(~valid_distogram_mask, 0)
 
         if exists(atom_indices_for_frame):
@@ -7837,8 +7805,9 @@ class Alphafold3(Module):
                 )
 
                 is_token_center_atom = torch.zeros_like(atom_pos[..., 0], dtype=torch.bool)
+                batch_indices, token_indices = torch.where(valid_molecule_atom_mask)
                 is_token_center_atom[
-                    torch.arange(batch_size).unsqueeze(1), molecule_atom_indices
+                    batch_indices, molecule_atom_indices[batch_indices, token_indices]
                 ] = True
                 is_any_token_center_atom_pair = repeat(
                     is_token_center_atom, "... j -> ... i j", i=is_token_center_atom.shape[-1]
@@ -7913,13 +7882,17 @@ class Alphafold3(Module):
                 mask: Bool['b ...'],
                 ignore_index: int
             ) -> Float['']:
-                labels = torch.where(mask, labels, ignore_index)
+                labels = torch.where(mask, labels.long(), ignore_index)
 
-                return F.cross_entropy(
-                    einx.multiply('b ..., b -> b ...', logits, weight),
-                    einx.multiply('b ..., b -> b ...', labels, weight.long()),
-                    ignore_index = ignore_index
+                loss = F.cross_entropy(
+                    logits,
+                    labels,
+                    ignore_index = ignore_index,
+                    reduction = 'none'
                 )
+                loss = einx.multiply('b ..., b -> b ...', loss, weight)
+
+                return masked_mean(loss, mask)
 
             if verbose:
                 logger.info("Calculating confidence head losses...")
