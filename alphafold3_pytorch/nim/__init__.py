@@ -1,8 +1,8 @@
 """Lazy, USE_NIM-gated access to the Nim-backed data functions.
 
-The Nim modules (`msa_features.nim`, `a3m_parse.nim`) are compiled on first
-import by nimporter_plus, so importing this package never requires Nim to be
-installed or triggers a compilation.
+The Nim modules (`msa_features.nim`, `a3m_parse.nim`, `species_id.nim`,
+`msa_stats.nim`) are compiled on first import by nimporter_plus, so importing
+this package never requires Nim to be installed or triggers a compilation.
 """
 
 import os
@@ -33,9 +33,14 @@ def _load_nim_modules() -> dict:
 
         import nimporter_plus  # registers the nim import hook
 
-        from alphafold3_pytorch.nim import a3m_parse, msa_features  # compiles the nim modules
+        from alphafold3_pytorch.nim import a3m_parse, msa_features, msa_stats, species_id  # compiles the nim modules
 
-        _nim_modules.update(a3m_parse = a3m_parse, msa_features = msa_features)
+        _nim_modules.update(
+            a3m_parse = a3m_parse,
+            msa_features = msa_features,
+            msa_stats = msa_stats,
+            species_id = species_id,
+        )
     except Exception:
         pass
 
@@ -50,6 +55,16 @@ def import_nim_msa_features() -> Optional[Any]:
 def import_nim_a3m_parse() -> Optional[Any]:
     """Return the Nim a3m parsing module, or `None` if unavailable."""
     return _load_nim_modules().get('a3m_parse')
+
+
+def import_nim_species_id() -> Optional[Any]:
+    """Return the Nim species id extraction module, or `None` if unavailable."""
+    return _load_nim_modules().get('species_id')
+
+
+def import_nim_msa_stats() -> Optional[Any]:
+    """Return the Nim MSA profile/deletion mean module, or `None` if unavailable."""
+    return _load_nim_modules().get('msa_stats')
 
 
 def deletion_bytes_to_matrix(deletion_bytes: bytes, row_lengths: List[int]) -> List[List[int]]:

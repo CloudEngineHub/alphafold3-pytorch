@@ -5,11 +5,18 @@
 # Bulk integer data crosses the Python boundary zero-copy as int32 `bytes`
 # buffers, since nimpy's element-wise seq/list conversion dominates the
 # runtime at production MSA sizes.
+#
+# Sequence indexing mirrors Python `str` (code-point indexing): ASCII
+# sequences take a byte-level fast path, while sequences containing unicode
+# are indexed rune by rune. Out-of-range polymer residue lookups raise a
+# `ValueError` (the Python path raises `IndexError`/`AssertionError` for the
+# same malformed inputs) instead of reading out of bounds.
 
 import nimpy
 import nimpy/py_lib as lib
 import nimpy/py_types
 import nimpy/raw_buffers
+import std/unicode
 
 proc newByteArray(size: int): (PPyObject, ptr UncheckedArray[int32]) =
   ## Create a zero-copy int32 buffer over a fresh `bytes` object.
@@ -37,6 +44,44 @@ proc bytesToInt32Ptr(o: PyObject): ptr UncheckedArray[int32] =
   getBuffer(o, buf, PyBUF_SIMPLE)
   result = cast[ptr UncheckedArray[int32]](buf.buf)
   release(buf)
+
+proc isAsciiChar(c: char): bool =
+  c.int <= 0x7F
+
+proc isAllAscii(s: string): bool =
+  for c in s:
+    if not isAsciiChar(c):
+      return false
+  true
+
+proc utf8Width(b: uint8): int =
+  if b < 0x80: 1
+  elif (b shr 5) == 0b110: 2
+  elif (b shr 4) == 0b1110: 3
+  else: 4
+
+proc codePointAt(s: string, index: int): (bool, int) =
+  ## Python `str`-style code-point lookup; `(false, 0)` when out of range.
+  var byte_offset = 0
+  var code_point_count = 0
+  while code_point_count < index:
+    if byte_offset >= s.len:
+      return (false, 0)
+    byte_offset += utf8Width(s[byte_offset].uint8)
+    inc code_point_count
+  if byte_offset >= s.len:
+    return (false, 0)
+  let b = int(s[byte_offset].uint8)
+  if b < 0x80:
+    (true, b)
+  elif (b shr 5) == 0b110:
+    (true, (b and 0x1F) shl 6 or int(s[byte_offset + 1].uint8 and 0x3F))
+  elif (b shr 4) == 0b1110:
+    (true, (b and 0x0F) shl 12 or (int(s[byte_offset + 1].uint8 and 0x3F) shl 6) or
+     int(s[byte_offset + 2].uint8 and 0x3F))
+  else:
+    (true, (b and 0x07) shl 18 or (int(s[byte_offset + 1].uint8 and 0x3F) shl 12) or
+     (int(s[byte_offset + 2].uint8 and 0x3F) shl 6) or int(s[byte_offset + 3].uint8 and 0x3F))
 
 proc msa_chain_to_int_features*(
     sequences: seq[string],
@@ -67,6 +112,9 @@ proc msa_chain_to_int_features*(
 
   for s, seq in sequences:
     var polymer_residue_index = -1
+    let seq_all_ascii = isAllAscii(seq)
+    # python `len(sequence)` counts code points, nim `seq.len` counts bytes
+    let seq_len = if seq_all_ascii: seq.len else: seq.toRunes.len
 
     for idx in 0 ..< num_res:
       let chemtype = chemtypes[idx]
@@ -86,15 +134,38 @@ proc msa_chain_to_int_features*(
         # ligands use the unknown residue type and have no deletions
         msa_res_type = restype_num
       else:
-        let res = seq[polymer_residue_index]
-        let c = int(res)
-        msa_res_type = if c < 256 and table[c] >= 0: table[c] else: restype_num
+        if polymer_residue_index >= seq_len:
+          # python raises `IndexError: string index out of range` here
+          raise newException(
+            ValueError,
+            "Polymer residue index length mismatch: " &
+            $(polymer_residue_index + 1) & " > " & $seq_len
+          )
+
+        if seq_all_ascii:
+          msa_res_type = if table[int(seq[polymer_residue_index])] >= 0:
+              table[int(seq[polymer_residue_index])]
+            else:
+              restype_num
+        else:
+          let (_, code) = codePointAt(seq, polymer_residue_index)
+          # python: `MSA_CHAR_TO_ID.get(res, restype_num)`; table entries are
+          # ASCII chars, so anything outside the table falls back
+          msa_res_type = if code < 256 and table[code] >= 0: table[code] else: restype_num
+
+        if polymer_residue_index >= deletion_row_lengths[s]:
+          # python raises `IndexError` from the deletion matrix row lookup
+          raise newException(
+            ValueError,
+            "Deletion matrix row length mismatch for sequence " & $s & ": " &
+            $(polymer_residue_index + 1) & " > " & $deletion_row_lengths[s]
+          )
         msa_deletion_value = deletion_matrix_flat[deletion_offset + polymer_residue_index]
 
       int_ptr[s * num_res + idx] = msa_res_type
       del_ptr[s * num_res + idx] = msa_deletion_value
 
-    if polymer_residue_index + 1 != seq.len:
+    if polymer_residue_index + 1 != seq_len:
       raise newException(
         ValueError,
         "Polymer residue index length mismatch: " &

@@ -22,7 +22,12 @@ from alphafold3_pytorch.data.template_parsing import (
     TEMPLATE_TYPE,
     _extract_template_features,
 )
-from alphafold3_pytorch.nim import deletion_bytes_to_matrix, import_nim_msa_features
+from alphafold3_pytorch.nim import (
+    deletion_bytes_to_matrix,
+    import_nim_msa_features,
+    import_nim_msa_stats,
+    import_nim_species_id,
+)
 from alphafold3_pytorch.tensor_typing import typecheck
 from alphafold3_pytorch.utils.data_utils import make_one_hot_np
 from alphafold3_pytorch.utils.utils import exists, not_exists
@@ -117,8 +122,12 @@ def _nim_msa_chain_to_int_features(
     chain_chemtype,
     chain_residue_index,
     ligand_chemtype_index: int,
-) -> Tuple[List[List[int]], List[List[int]]]:
-    """Convert unique MSA sequences to integer residue types and deletion values with Nim."""
+) -> Tuple[List[List[int]], List[List[int]], bytes, bytes]:
+    """Convert unique MSA sequences to integer residue types and deletion values with Nim.
+
+    The raw int32 buffers are returned alongside the decoded lists so that
+    downstream Nim computations can consume them zero-copy.
+    """
     chain_chemtype = np.asarray(chain_chemtype, dtype=np.int32)
     chain_residue_index = np.asarray(chain_residue_index, dtype=np.int32)
 
@@ -162,7 +171,7 @@ def _nim_msa_chain_to_int_features(
         deletions_bytes, dtype=np.int32
     ).reshape(len(sequences), len(chain_chemtype)).tolist()
 
-    return int_msa, deletion_matrix
+    return int_msa, deletion_matrix, int_msa_bytes, deletions_bytes
 
 
 @typecheck
@@ -197,6 +206,8 @@ def make_msa_features(
     entity_ids = {}
 
     nim_msa_features = import_nim_msa_features()
+    nim_species_id = import_nim_species_id()
+    nim_msa_stats = import_nim_msa_stats()
 
     for chain_id, msa in msas.items():
         int_msa = []
@@ -219,6 +230,7 @@ def make_msa_features(
 
         nim_sequences = []
         nim_deletion_rows = []
+        nim_descriptions = []
 
         for sequence_index, sequence in enumerate(msa.sequences):
             if sequence_index == 0:
@@ -287,18 +299,21 @@ def make_msa_features(
                 int_msa.append(msa_res_types)
                 deletion_matrix.append(msa_deletion_values)
 
-            # Parse species ID for MSA pairing if possible.
-            species_id = msa_parsing.get_identifiers(
-                description=msa.descriptions[sequence_index],
-                tab_separated_alignment_headers=tab_separated_alignment_headers,
-            ).species_id
+            if exists(nim_species_id):
+                nim_descriptions.append(msa.descriptions[sequence_index])
+            else:
+                # Parse species ID for MSA pairing if possible.
+                species_id = msa_parsing.get_identifiers(
+                    description=msa.descriptions[sequence_index],
+                    tab_separated_alignment_headers=tab_separated_alignment_headers,
+                ).species_id
 
-            if sequence_index == 0:
-                species_id = "-1"  # Tag target sequence for filtering.
-            species_ids.append(species_id)
+                if sequence_index == 0:
+                    species_id = "-1"  # Tag target sequence for filtering.
+                species_ids.append(species_id)
 
         if exists(nim_msa_features):
-            int_msa, deletion_matrix = _nim_msa_chain_to_int_features(
+            int_msa, deletion_matrix, int_msa_bytes, deletions_bytes = _nim_msa_chain_to_int_features(
                 nim_msa_features,
                 nim_sequences,
                 nim_deletion_rows,
@@ -306,6 +321,12 @@ def make_msa_features(
                 chain_residue_index,
                 ligand_chemtype_index,
             )
+
+        if exists(nim_species_id) and nim_descriptions:
+            species_ids = nim_species_id.species_ids(
+                nim_descriptions, tab_separated_alignment_headers
+            )
+            species_ids[0] = "-1"  # Tag target sequence for filtering.
 
         # Pad the MSA to the maximum number of alignments across all chains for dataloading.
         num_padding_alignments = max_alignments - len(int_msa)
@@ -331,12 +352,25 @@ def make_msa_features(
         chain["entity_id"] = np.array([entity_ids[msa.sequences[0]]], dtype=np.int64)
 
         # NOTE: Here, we compute the profile and deletion average features for the unpadded MSA.
-        chain["profile_all_seq"] = make_one_hot_np(
-            np.array(int_msa, dtype=np.int64), num_msa_one_hot
-        ).mean(0)
-        chain["deletion_mean_all_seq"] = (
-            np.clip(np.array(deletion_matrix, dtype=np.float32), 0.0, 1.0)
-        ).mean(0)
+        if exists(nim_msa_features) and exists(nim_msa_stats) and nim_sequences:
+            profile_bytes, deletion_mean_bytes = nim_msa_stats.msa_profile(
+                int_msa_bytes,
+                deletions_bytes,
+                len(nim_sequences),
+                num_res,
+                num_msa_one_hot,
+            )
+            chain["profile_all_seq"] = np.frombuffer(profile_bytes, dtype = np.float64).reshape(
+                num_res, num_msa_one_hot
+            ).copy()
+            chain["deletion_mean_all_seq"] = np.frombuffer(deletion_mean_bytes, dtype = np.float32).copy()
+        else:
+            chain["profile_all_seq"] = make_one_hot_np(
+                np.array(int_msa, dtype=np.int64), num_msa_one_hot
+            ).mean(0)
+            chain["deletion_mean_all_seq"] = (
+                np.clip(np.array(deletion_matrix, dtype=np.float32), 0.0, 1.0)
+            ).mean(0)
 
         chains.append(chain)
 
